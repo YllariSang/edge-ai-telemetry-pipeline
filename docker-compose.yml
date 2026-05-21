@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  web_dashboard:
+    build: .
+    container_name: v380_dashboard
+    ports:
+      - "8050:8050"
+    volumes:
+      - ./v380_analytics.db:/app/v380_analytics.db
+    environment:
+      - RTSP_URL=rtsp://admin:YOUR_PASSWORD_HERE@192.168.100.188:554/live/ch00_0
+      - OLLAMA_URL=http://ollama_engine:11434/api/generate
+    depends_on:
+      - ollama_engine
+    restart: unless-stopped
+
+  ollama_engine:
+    image: ollama/ollama:latest
+    container_name: ollama_engine
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_storage:/root/.ollama
+    restart: unless-stopped
+
+volumes:
+  ollama_storage:
