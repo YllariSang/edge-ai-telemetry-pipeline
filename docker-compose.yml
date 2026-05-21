@@ -22,6 +22,9 @@ services:
       - "11434:11434"
     volumes:
       - ollama_storage:/root/.ollama
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     restart: unless-stopped
 
 volumes:
