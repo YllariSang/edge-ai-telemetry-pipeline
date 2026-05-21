@@ -17,8 +17,13 @@ DB_FILE = "v380_analytics.db"
 AI_DETECTION_INTERVAL = 0.2
 
 # Pull credentials safely from environment variables to secure public Git pushes
-RTSP_URL = os.getenv("RTSP_URL", "rtsp://admin:YOUR_PASSWORD_HERE@192.168.100.188:554/live/ch00_0")
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434/api/generate")
+RTSP_URL = os.getenv("RTSP_URL")
+if not RTSP_URL:
+    raise ValueError("[❌] Critical Error: RTSP_URL environment variable is missing! Please export it before running.")
+
+# Split base host from the specific API endpoint for clean networking abstraction
+OLLAMA_BASE = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
+OLLAMA_URL = f"{OLLAMA_BASE.rstrip('/')}/api/generate"
 
 # --- NETWORK VIDEO STREAM MANAGEMENT ---
 class LowLatencyRingBuffer:
@@ -317,10 +322,14 @@ def chatbot_endpoint(user_message: str = Form(...)):
         response = requests.post(OLLAMA_URL, json=payload, timeout=30)
         if response.status_code == 200:
             return {"response": response.json().get("response", "Parsing error.").strip()}
-        return {"response": "Ollama service returned an error state."}
+        return {"response": f"Ollama service returned error status code: {response.status_code}."}
 
+    except requests.exceptions.Timeout:
+        return {"response": "[⏳] Chat request timed out. Llama 3.2 is taking too long to wake up or process tensors on your system hardware."}
+    except requests.exceptions.ConnectionError:
+        return {"response": "[❌] Connection Refused: Could not reach Ollama. Please ensure your native engine service is active via 'sudo systemctl start ollama'."}
     except Exception as e:
-        return {"response": f"Chat engine exception caught: {e}. Is Ollama active?"}
+        return {"response": f"Chat engine exception caught: {e}"}
 
 # --- WEB APPLICATION ROUTER & USER INTERFACE ---
 @app.get("/", response_class=responses.HTMLResponse)
@@ -500,7 +509,6 @@ def serve_dashboard():
                 const msgText = inputEl.value;
 
                 if (msgText.trim() !== "") {{
-                    // Concatenate plain text strings directly to bypass f-string parsing rules
                     boxEl.innerHTML += "<div class='msg user'>" + msgText + "</div>";
                     inputEl.value = "";
                     boxEl.scrollTop = boxEl.scrollHeight;
