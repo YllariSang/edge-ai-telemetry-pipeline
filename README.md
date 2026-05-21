@@ -1,8 +1,6 @@
-Markdown
+# SeeSee: Edge AI Telemetry Pipeline
 
-# V380 Pro AI Analytics Center
-
-Basically a local, cloud-free telemetry setup for my CCTV camera. It takes a live network stream, runs it through some vision math to track what me and my dog are doing in the room, logs everything to a database, and lets me talk to Llama 3.2:1b completely offline to summarize what happened. 
+Basically a local, cloud-free telemetry setup for my CCTV camera. It takes a live network stream, runs it through some vision math to track what me and my dog are doing in the room, logs everything to a database, and lets me talk to Llama 3.2:1b completely offline to summarize what happened.
 
 ---
 
@@ -47,9 +45,9 @@ Basically a local, cloud-free telemetry setup for my CCTV camera. It takes a liv
 ---
 
 ## The Tech Stack
-- **OS**: Arch Linux
+- **OS**: Cross-Platform (Linux, macOS, Windows)
 - **Backend Framework**: FastAPI (Uvicorn ASGI Engine)
-- **Computer Vision**: OpenCV-Python & Ultralytics YOLO11
+- **Computer Vision**: OpenCV-Python (Headless Framework) & Ultralytics YOLO11
 - **Database**: SQLite 3
 - **AI Engine**: Ollama running `llama3.2:1b`
 
@@ -57,69 +55,82 @@ Basically a local, cloud-free telemetry setup for my CCTV camera. It takes a liv
 
 ## Project Structure
 ```text
-v380-yolo/
-├── .gitignore               # Keeps local DB logs, .env files, and model weights out of GitHub
+SeeSee/
+├── .gitignore               # Keeps local DB logs, virtual envs, and model weights out of GitHub
 ├── README.md                # This file right here
 ├── requirements.txt         # The Python package dependencies list
-├── Dockerfile               # Build configuration for the application container
-├── docker-compose.yml       # Multi-container orchestrator layout
-└── dashboard_app.py         # Main source code script
-
-Quick Start
-Run via Docker (Recommended)
-
-Docker handles the entire isolated environment so you don't have to break your brain reinstalling system libraries or model weights.
-
-    Clone the repo:
-    Bash
-
-    git clone <YOUR_REPOSITORY_URL>
-    cd v380-yolo
-
-    Add your camera credentials:
-    Open docker-compose.yml and replace the placeholder credentials inside the environment block with your camera's active username, password, and local IP:
-    YAML
-
-    environment:
-      - RTSP_URL=rtsp://admin:your_secret_password@192.168.100.188:554/live/ch00_0
-
-    Spin it up:
-    Bash
-
-    docker-compose up --build -d
-
-    Pull the model files:
-    Since it's the first initialization, run this into the container to download the local model parameters (it's going to pull a few gigabytes of tensors, just let it do its thing):
-    Bash
-
-    docker exec -it ollama_engine ollama run llama3.2:1b
-
-    Open the interface: Open your browser and go to http://localhost:8050.
+└── dashboard_app.py         # Production-ready main source code script
 
 Run Natively
 
-    Set up a virtual environment:
+Since the pipeline uses headless matrix tracking components and standard RTSP streaming, it is completely cross-platform and runs identically on Linux, macOS, and Windows.
+1. Set Up a Virtual Environment
+
+Initialize a clean Python environment for your operating system:
+
+    Linux / macOS:
     Bash
 
     python -m venv venv
     source venv/bin/activate
 
-    Install the dependencies:
+    Windows (PowerShell):
+    PowerShell
+
+    python -m venv venv
+    .\venv\Scripts\Activate.ps1
+
+    Windows (Command Prompt):
+    DOS
+
+    python -m venv venv
+    .\venv\Scripts\activate.bat
+
+2. Install Dependencies
+
+Install the lightweight, unbloated requirements list (uses headless modules to prevent server GUI driver collisions):
+Bash
+
+pip install -r requirements.txt
+
+3. Spin Up Ollama (Local AI Engine)
+
+Ensure your local language model engine is active on localhost:11434 and running the required model profile:
+
+    Linux (systemd): sudo systemctl start ollama
+
+    Linux (Non-systemd / Manual): ollama serve &
+
+    Windows / macOS: Launch the native Ollama Desktop Application from your system application menu.
+
+Make sure you have downloaded the weights into your engine instance:
+Bash
+
+ollama run llama3.2:1b
+
+4. Export Credentials & Boot the Pipeline
+
+Set your camera's live RTSP stream path network details as environment variables and execute the launch runner:
+
+    Linux / macOS:
     Bash
 
-    pip install -r requirements.txt
-
-    Export your secrets:
-    Bash
-
-    export RTSP_URL="rtsp://admin:your_secret_password@192.168.100.188:554/live/ch00_0"
-    export OLLAMA_URL="[http://127.0.0.1:11434/api/generate](http://127.0.0.1:11434/api/generate)"
-
-    Run the script:
-    Bash
-
+    export RTSP_URL="rtsp://<username>:<password>@<camera-ip-address>:554/live/ch00_0"
     python dashboard_app.py
 
+    Windows (PowerShell):
+    PowerShell
+
+    $env:RTSP_URL="rtsp://<username>:<password>@<camera-ip-address>:554/live/ch00_0"
+    python dashboard_app.py
+
+    Windows (Command Prompt):
+    DOS
+
+    set RTSP_URL=rtsp://<username>:<password>@<camera-ip-address>:554/live/ch00_0
+    python dashboard_app.py
+
+Open your browser and navigate to http://localhost:8050 to access your live analytics dashboard center!
 Privacy Details
 
     100% Offline: Zero tracking, remote keys, or cloud subscriptions. Everything stays entirely on the local drive.
