@@ -7,24 +7,26 @@ import requests
 import json
 from collections import deque
 from ultralytics import YOLO
-from fastapi import FastAPI, responses, Form
+from fastapi import FastAPI, responses, Form, Request
 import uvicorn
 from contextlib import asynccontextmanager
 
-# --- SYSTEM CONFIGURATION CONFIGS ---
 DB_FILE = "v380_analytics.db"
 AI_DETECTION_INTERVAL = 0.2
 
-# Pull credentials safely from environment variables to secure public Git pushes
+raw_device = os.getenv("YOLO_DEVICE", "cpu").lower().strip()
+if raw_device == "gpu":
+    YOLO_DEVICE = "0"
+else:
+    YOLO_DEVICE = raw_device
+
 RTSP_URL = os.getenv("RTSP_URL")
 if not RTSP_URL:
     raise ValueError("[❌] Critical Error: RTSP_URL environment variable is missing! Please export it before running.")
 
-# Split base host from the specific API endpoint for clean networking abstraction
 OLLAMA_BASE = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
-OLLAMA_URL = f"{OLLAMA_BASE.rstrip('/')}/api/generate"
+OLLAMA_URL = f"{OLLAMA_BASE.rstrip('/')}/api/chat"
 
-# --- NETWORK VIDEO STREAM MANAGEMENT ---
 class LowLatencyRingBuffer:
     def __init__(self, src):
         self.src = src
@@ -61,117 +63,131 @@ class LowLatencyRingBuffer:
             return True, self.buffer[0].copy()
         return False, None
 
-# --- RELATIONAL STORAGE SCHEMA & TRANSACTIONS (WAL OPTIMIZED) ---
 def init_db():
     with sqlite3.connect(DB_FILE, timeout=15.0) as conn:
         cursor = conn.cursor()
-        cursor.execute("PRAGMA journal_mode=WAL;")
-        cursor.execute("PRAGMA synchronous=NORMAL;")
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS security_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT DEFAULT (datetime('now', 'localtime')),
-                target_class TEXT,
-                action_defined TEXT,
-                peak_confidence REAL,
-                duration_secs REAL
-            )
-        """)
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_target ON security_logs(target_class)")
+        try:
+            cursor.execute("PRAGMA journal_mode=WAL;")
+            cursor.execute("PRAGMA synchronous=NORMAL;")
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS security_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT DEFAULT (datetime('now', 'localtime')),
+                    target_class TEXT,
+                    action_defined TEXT,
+                    peak_confidence REAL,
+                    duration_secs REAL
+                )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_target ON security_logs(target_class)")
+            cursor.execute("DELETE FROM security_logs WHERE timestamp < datetime('now', '-30 days');")
+            print("[🗄️] Database initialized and data older than 30 days pruned successfully.")
+            conn.commit()
+        finally:
+            cursor.close()
 
 def log_event_to_db(target, action, confidence, duration):
     with sqlite3.connect(DB_FILE, timeout=15.0) as conn:
         cursor = conn.cursor()
-        cursor.execute("PRAGMA journal_mode=WAL;")
-        cursor.execute("""
-            INSERT INTO security_logs (target_class, action_defined, peak_confidence, duration_secs)
-            VALUES (?, ?, ?, ?)
-        """, (target, action, round(confidence, 2), round(duration, 1)))
+        try:
+            cursor.execute("PRAGMA journal_mode=WAL;")
+            cursor.execute("""
+                INSERT INTO security_logs (target_class, action_defined, peak_confidence, duration_secs)
+                VALUES (?, ?, ?, ?)
+            """, (target, action, round(confidence, 2), round(duration, 1)))
+            conn.commit()
+        finally:
+            cursor.close()
 
 def query_db(sql, params=()):
     with sqlite3.connect(DB_FILE, timeout=15.0) as conn:
         cursor = conn.cursor()
-        cursor.execute("PRAGMA journal_mode=WAL;")
-        cursor.execute(sql, params)
-        return cursor.fetchall()
+        try:
+            cursor.execute("PRAGMA journal_mode=WAL;")
+            cursor.execute(sql, params)
+            return cursor.fetchall()
+        finally:
+            cursor.close()
 
-# --- SPATIAL GEOMETRY & TELEMETRY PROCESSING ---
 class AdvancedSpatialTracker:
     def __init__(self, target_name):
         self.target_name = target_name
         self.active_tracks = {}
+        self.lock = threading.Lock()
 
     def process_frame_tracks(self, current_frame_detections):
         now = time.time()
         
-        for det in current_frame_detections:
-            tid = det["track_id"]
-            conf = det["conf"]
-            x1, y1, x2, y2 = det["box"]
-            
-            w, h = x2 - x1, y2 - y1
-            cx, cy = x1 + (w / 2), y1 + (h / 2)
-            aspect_ratio = w / float(h) if h > 0 else 0
-
-            if tid not in self.active_tracks:
-                self.active_tracks[tid] = {
-                    "start_time": now,
-                    "last_seen": now,
-                    "peak_confidence": conf,
-                    "current_action": "Calibrating",
-                    "last_state_change": now,
-                    "history": deque(maxlen=15)
-                }
-
-            track = self.active_tracks[tid]
-            track["last_seen"] = now
-            track["peak_confidence"] = max(track["peak_confidence"], conf)
-            track["history"].append({"cx": cx, "cy": cy, "ar": aspect_ratio, "h": h})
-
-            if len(track["history"]) == track["history"].maxlen and (now - track["last_state_change"] > 1.5):
-                proposed_action = track["current_action"]
+        with self.lock:
+            for det in current_frame_detections:
+                tid = det["track_id"]
+                conf = det["conf"]
+                x1, y1, x2, y2 = det["box"]
                 
-                if self.target_name == "Human":
-                    avg_ar = sum(f["ar"] for f in track["history"]) / len(track["history"])
-                    dx = abs(track["history"][-1]["cx"] - track["history"][0]["cx"]) / h
-                    dy = abs(track["history"][-1]["cy"] - track["history"][0]["cy"]) / h
-                    total_velocity = dx + dy
+                w, h = x2 - x1, y2 - y1
+                cx, cy = x1 + (w / 2), y1 + (h / 2)
+                aspect_ratio = w / float(h) if h > 0 else 0
 
-                    if total_velocity > 0.18:
-                        proposed_action = "Standing/Moving"
-                    elif avg_ar > 0.72:
-                        proposed_action = "Sitting/Working"
-                    else:
-                        proposed_action = "Stationary/Standing"
-                        
-                elif self.target_name == "Doggo":
-                    dx = abs(track["history"][-1]["cx"] - track["history"][0]["cx"])
-                    dy = abs(track["history"][-1]["cy"] - track["history"][0]["cy"])
-                    total_velocity = dx + dy
+                if tid not in self.active_tracks:
+                    self.active_tracks[tid] = {
+                        "start_time": now,
+                        "last_seen": now,
+                        "peak_confidence": conf,
+                        "current_action": "Calibrating",
+                        "last_state_change": now,
+                        "history": deque(maxlen=15)
+                    }
 
-                    if total_velocity > 40:
-                        proposed_action = "Pacing/Moving"
-                    else:
-                        proposed_action = "Bedded/Sleeping"
+                track = self.active_tracks[tid]
+                track["last_seen"] = now
+                track["peak_confidence"] = max(track["peak_confidence"], conf)
+                track["history"].append({"cx": cx, "cy": cy, "ar": aspect_ratio, "h": h})
 
-                if proposed_action != track["current_action"]:
-                    track["current_action"] = proposed_action
-                    track["last_state_change"] = now
+                if len(track["history"]) == track["history"].maxlen and (now - track["last_state_change"] > 1.5):
+                    proposed_action = track["current_action"]
+                    
+                    if self.target_name == "Human":
+                        avg_ar = sum(f["ar"] for f in track["history"]) / len(track["history"])
+                        dx = abs(track["history"][-1]["cx"] - track["history"][0]["cx"]) / h
+                        dy = abs(track["history"][-1]["cy"] - track["history"][0]["cy"]) / h
+                        total_velocity = dx + dy
 
-        stale_ids = [tid for tid, t_meta in self.active_tracks.items() if now - t_meta["last_seen"] > 2.0]
-        for tid in stale_ids:
-            t_meta = self.active_tracks[tid]
-            duration = t_meta["last_seen"] - t_meta["start_time"]
-            
-            if duration > 1.5 and t_meta["current_action"] != "Calibrating":
-                log_event_to_db(self.target_name, t_meta["current_action"], t_meta["peak_confidence"], duration)
-            
-            del self.active_tracks[tid]
+                        if total_velocity > 0.18:
+                            proposed_action = "Standing/Moving"
+                        elif avg_ar > 0.72:
+                            proposed_action = "Sitting/Working"
+                        else:
+                            proposed_action = "Stationary/Standing"
+                            
+                    elif self.target_name == "Doggo":
+                        dx = abs(track["history"][-1]["cx"] - track["history"][0]["cx"])
+                        dy = abs(track["history"][-1]["cy"] - track["history"][0]["cy"])
+                        total_velocity = dx + dy
+
+                        if total_velocity > 40:
+                            proposed_action = "Pacing/Moving"
+                        else:
+                            proposed_action = "Bedded/Sleeping"
+
+                    if proposed_action != track["current_action"]:
+                        track["current_action"] = proposed_action
+                        track["last_state_change"] = now
+
+            stale_ids = [tid for tid, t_meta in self.active_tracks.items() if now - t_meta["last_seen"] > 2.0]
+            for tid in stale_ids:
+                t_meta = self.active_tracks[tid]
+                duration = t_meta["last_seen"] - t_meta["start_time"]
+                
+                if duration > 1.5 and t_meta["current_action"] != "Calibrating":
+                    log_event_to_db(self.target_name, t_meta["current_action"], t_meta["peak_confidence"], duration)
+                
+                del self.active_tracks[tid]
 
     def get_current_action(self, track_id):
-        if track_id in self.active_tracks:
-            return self.active_tracks[track_id]["current_action"]
-        return "Calibrating"
+        with self.lock:
+            if track_id in self.active_tracks:
+                return self.active_tracks[track_id]["current_action"]
+            return "Calibrating"
 
 stream_bridge = None
 yolo_model = None
@@ -180,7 +196,6 @@ dog_tracker = AdvancedSpatialTracker("Doggo")
 latest_processed_frame = None
 frame_lock = threading.Lock()
 
-# --- DATA SANITIZATION & TRANSLATION LAYER ---
 def sanitize_telemetry_logs(rows):
     translation_layer = {
         "Calibrating": "entering or settling into the room briefly",
@@ -194,14 +209,12 @@ def sanitize_telemetry_logs(rows):
     if not rows:
         return "The camera tracking logs are currently empty."
 
-    # Group consecutive identical target + action events together
     compressed_events = []
-    for r in reversed(rows): # Read chronologically
+    for r in reversed(rows):
         timestamp, target, action, duration = r
         friendly_action = translation_layer.get(action, action.lower())
         
         if compressed_events and compressed_events[-1]['target'] == target and compressed_events[-1]['friendly_action'] == friendly_action:
-            # If the same subject is doing the same thing consecutively, accumulate the duration
             compressed_events[-1]['duration'] += duration
         else:
             compressed_events.append({
@@ -217,7 +230,6 @@ def sanitize_telemetry_logs(rows):
     
     return clean_text
 
-# --- BACKGROUND COMPUTER VISION WORKER ---
 def background_ai_inference_worker():
     global stream_bridge, yolo_model, human_tracker, dog_tracker, latest_processed_frame
 
@@ -228,7 +240,7 @@ def background_ai_inference_worker():
             time.sleep(0.01)
             continue
 
-        results = yolo_model.track(frame, persist=True, device="cpu", verbose=False, imgsz=640)[0]
+        results = yolo_model.track(frame, persist=True, device=YOLO_DEVICE, verbose=False, imgsz=640)[0]
 
         human_detections_this_frame = []
         dog_detections_this_frame = []
@@ -275,21 +287,38 @@ def background_ai_inference_worker():
         sleep_t = max(0.001, AI_DETECTION_INTERVAL - elapsed)
         time.sleep(sleep_t)
 
-# --- MODERN LIFESPAN LIFECYCLE MANAGEMENT ---
+def sync_ollama_models():
+    try:
+        base_url = OLLAMA_BASE.rstrip('/')
+        print(f"[🤖] Pinging Ollama host endpoint at: {base_url}")
+        requests.get(base_url, timeout=3)
+        
+        pull_url = f"{base_url}/api/pull"
+        print("[🤖] Connection active. Synchronizing Llama 3.2:1b weights...")
+        requests.post(pull_url, json={"name": "llama3.2:1b"}, timeout=15)
+        print("[✅] Local model synchronization complete.")
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+        print("[❌] Pre-flight Check Failed: Ollama backend service is dead, unresponsive, or running on an alternate port.")
+    except Exception as e:
+        print(f"[⚠️] Unexpected engine alert encountered: {e}")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global stream_bridge, yolo_model
+    global stream_bridge, yolo_model, YOLO_DEVICE
     init_db()
     
-    try:
-        print("[🤖] Checking local Ollama engine model layer...")
-        pull_url = f"{OLLAMA_BASE.rstrip('/')}/api/pull"
-        requests.post(pull_url, json={"name": "llama3.2:1b"}, timeout=10)
-        print("[✅] Local Llama 3.2:1b layer synchronized successfully.")
-    except Exception as e:
-        print(f"[⚠️] Model verification failed (Is Ollama engine booting up?): {e}")
+    threading.Thread(target=sync_ollama_models, daemon=True).start()
 
-    yolo_model = YOLO("yolo11n_openvino_model/")
+    print(f"[🚀] Validating YOLO tracking inference hardware device target: {YOLO_DEVICE}")
+    yolo_model = YOLO("yolo11n_openvino_model/", task="detect")
+    
+    try:
+        dummy_frame = cv2.Mat.zeros(height=640, width=640, type=cv2.CV_8UC3)
+        yolo_model.track(dummy_frame, persist=True, device=YOLO_DEVICE, verbose=False, imgsz=640)
+    except Exception as e:
+        print(f"[⚠️] Pre-flight Check: Execution failed for target ({YOLO_DEVICE}). Enforcing fallback to CPU runtime engine.")
+        YOLO_DEVICE = "cpu"
+
     stream_bridge = LowLatencyRingBuffer(RTSP_URL).start()
     threading.Thread(target=background_ai_inference_worker, daemon=True).start()
     print("[🚀] Headless AI Geometric Action Matrix Engaged Flawlessly.")
@@ -299,7 +328,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="V380 Pro AI Analytics Center", lifespan=lifespan)
 
-# --- WEB APPLICATION BACKEND ENDPOINTS ---
 @app.get("/video_feed")
 def video_feed_endpoint():
     return responses.StreamingResponse(generate_live_web_frames(), media_type="multipart/x-mixed-replace; boundary=frame")
@@ -349,10 +377,11 @@ def get_chart_data_endpoint():
         "comp_values": list(comp_dict.values())
     }
 
-# --- LOCAL GENERATIVE LLM CHAT MIDDLEWARE ---
 @app.post("/api/chat")
-def chatbot_endpoint(user_message: str = Form(...)):
+def chatbot_endpoint(history: str = Form(...)):
     try:
+        chat_history = json.loads(history)
+        
         rows = query_db("""
             SELECT timestamp, target_class, action_defined, duration_secs
             FROM security_logs ORDER BY id DESC LIMIT 15
@@ -365,26 +394,26 @@ def chatbot_endpoint(user_message: str = Form(...)):
             "the provided tracking logs. Speak like a normal person living in a house—never say things like 'the individual "
             "entered the building' or mention 'calibrating on a wall'. If the user asks about what happened, map the timestamps "
             "to their request. Keep answers clear, direct, and under 3 sentences."
+            f"\n\nSanitized Room Activity Logs:\n{sanitized_timeline_context}"
         )
 
-        prompt_payload = (
-            f"{system_prompt}\n\n"
-            f"Sanitized Room Activity Logs:\n{sanitized_timeline_context}\n\n"
-            f"User Question: {user_message}\n\n"
-            f"Answer:"
-        )
+        messages = [{"role": "system", "content": system_prompt}]
+        for msg in chat_history:
+            messages.append({"role": msg["role"], "content": msg["content"]})
 
         payload = {
             "model": "llama3.2:1b",
-            "prompt": prompt_payload,
+            "messages": messages,
             "stream": False
         }
 
         response = requests.post(OLLAMA_URL, json=payload, timeout=30)
         if response.status_code == 200:
-            return {"response": response.json().get("response", "Parsing error.").strip()}
+            return {"response": response.json().get("message", {}).get("content", "Parsing error.").strip()}
         return {"response": f"Ollama service returned error status code: {response.status_code}."}
 
+    except json.JSONDecodeError:
+        return {"response": "[❌] Content Malformed: Failed to cleanly reconstruct conversation context metadata."}
     except requests.exceptions.Timeout:
         return {"response": "[⏳] Chat request timed out. Llama 3.2 is taking too long to wake up or process tensors on your system hardware."}
     except requests.exceptions.ConnectionError:
@@ -392,7 +421,6 @@ def chatbot_endpoint(user_message: str = Form(...)):
     except Exception as e:
         return {"response": f"Chat engine exception caught: {e}"}
 
-# --- WEB APPLICATION ROUTER & USER INTERFACE ---
 @app.get("/", response_class=responses.HTMLResponse)
 def serve_dashboard():
     summary_data = query_db("""
@@ -414,7 +442,6 @@ def serve_dashboard():
         for row in recent_logs
     ]) or "<tr><td colspan='5'>Awaiting operational sequences...</td></tr>"
 
-    # CRITICAL SECURITY FIX: Use a normal triple-quote string without the f-prefix to bypass bracket parsing collision.
     html_template = """
     <!DOCTYPE html>
     <html>
@@ -511,6 +538,7 @@ def serve_dashboard():
         <script>
             let hourlyChartInstance = null;
             let compositionChartInstance = null;
+            let conversationHistory = [];
 
             async function renderAnalyticsCharts() {
                 try {
@@ -568,12 +596,14 @@ def serve_dashboard():
                 e.preventDefault();
                 const inputEl = document.getElementById('userInput');
                 const boxEl = document.getElementById('chatBox');
-                const msgText = inputEl.value;
+                const msgText = inputEl.value.trim();
 
-                if (msgText.trim() !== "") {
+                if (msgText !== "") {
                     boxEl.innerHTML += "<div class='msg user'>" + msgText + "</div>";
                     inputEl.value = "";
                     boxEl.scrollTop = boxEl.scrollHeight;
+
+                    conversationHistory.push({ role: "user", content: msgText });
 
                     const loadId = "load_" + Date.now();
                     boxEl.innerHTML += "<div class='msg ai' id='" + loadId + "'>Processing query...</div>";
@@ -581,12 +611,13 @@ def serve_dashboard():
 
                     try {
                         const formData = new FormData();
-                        formData.append("user_message", msgText);
+                        formData.append("history", JSON.stringify(conversationHistory));
 
                         const response = await fetch('/api/chat', { method: 'POST', body: formData });
                         const resData = await response.json();
 
                         document.getElementById(loadId).innerText = resData.response;
+                        conversationHistory.push({ role: "assistant", content: resData.response });
                     } catch(err) {
                         document.getElementById(loadId).innerText = "Unable to connect to local language model service.";
                     }
@@ -602,7 +633,6 @@ def serve_dashboard():
     </html>
     """
     
-    # Safely swap out variables without colliding with native JavaScript braces
     return html_template.replace("{SUMMARY_ROWS}", summary_rows).replace("{RECENT_ROWS}", recent_rows)
 
 if __name__ == "__main__":

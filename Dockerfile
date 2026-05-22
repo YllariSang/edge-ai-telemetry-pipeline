@@ -11,8 +11,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-RUN python -c "from ultralytics import YOLO; YOLO('yolo11n.pt')"
-
 COPY . .
 
 EXPOSE 8050
