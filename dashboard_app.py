@@ -9,8 +9,7 @@ from collections import deque
 from ultralytics import YOLO
 from fastapi import FastAPI, responses, Form
 import uvicorn
-
-app = FastAPI(title="V380 Pro AI Analytics Center")
+from contextlib import asynccontextmanager
 
 # --- SYSTEM CONFIGURATION CONFIGS ---
 DB_FILE = "v380_analytics.db"
@@ -28,6 +27,7 @@ OLLAMA_URL = f"{OLLAMA_BASE.rstrip('/')}/api/generate"
 # --- NETWORK VIDEO STREAM MANAGEMENT ---
 class LowLatencyRingBuffer:
     def __init__(self, src):
+        self.src = src
         self.cap = cv2.VideoCapture(src)
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         self.buffer = deque(maxlen=1)
@@ -41,13 +41,20 @@ class LowLatencyRingBuffer:
     def _capture_worker(self):
         while self.running:
             if not self.cap.isOpened():
-                break
+                print("[⚠️] Camera disconnected. Attempting reconnection in 5 seconds...")
+                time.sleep(5)
+                self.cap.open(self.src)
+                continue
+                
             ret, frame = self.cap.read()
             if ret:
                 self.ret = ret
                 self.buffer.append(frame)
             else:
-                time.sleep(0.01)
+                print("[⚠️] Frame drop or stream interruption detected. Reinitializing link...")
+                self.cap.release()
+                time.sleep(2)
+                self.cap.open(self.src)
 
     def get_frame(self):
         if self.ret and len(self.buffer) > 0:
@@ -56,7 +63,8 @@ class LowLatencyRingBuffer:
 
 # --- RELATIONAL STORAGE SCHEMA & TRANSACTIONS ---
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
+    # Set timeout to handle concurrent background locks gracefully
+    conn = sqlite3.connect(DB_FILE, timeout=10.0)
     cursor = conn.cursor()
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS security_logs (
@@ -73,7 +81,7 @@ def init_db():
     conn.close()
 
 def log_event_to_db(target, action, confidence, duration):
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=10.0)
     cursor = conn.cursor()
     cursor.execute("""
         INSERT INTO security_logs (target_class, action_defined, peak_confidence, duration_secs)
@@ -81,6 +89,14 @@ def log_event_to_db(target, action, confidence, duration):
     """, (target, action, round(confidence, 2), round(duration, 1)))
     conn.commit()
     conn.close()
+
+def query_db(sql, params=()):
+    conn = sqlite3.connect(DB_FILE, timeout=10.0)
+    cursor = conn.cursor()
+    cursor.execute(sql, params)
+    data = cursor.fetchall()
+    conn.close()
+    return data
 
 # --- SPATIAL GEOMETRY & TELEMETRY PROCESSING ---
 class AdvancedSpatialTracker:
@@ -217,22 +233,32 @@ def background_ai_inference_worker():
         sleep_t = max(0.001, AI_DETECTION_INTERVAL - elapsed)
         time.sleep(sleep_t)
 
-@app.on_event("startup")
-def startup_event():
+# --- MODERN LIFESPAN LIFECYCLE MANAGEMENT ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     global stream_bridge, yolo_model
     init_db()
+    
+    # Auto-synchronize Llama weights on container initialization
+    try:
+        print("[🤖] Checking local Ollama engine model layer...")
+        pull_url = f"{OLLAMA_BASE.rstrip('/')}/api/pull"
+        # Increase timeout slightly to allow a pull verification check response
+        requests.post(pull_url, json={"name": "llama3.2:1b"}, timeout=10)
+        print("[✅] Local Llama 3.2:1b layer synchronized successfully.")
+    except Exception as e:
+        print(f"[⚠️] Model verification failed (Is Ollama engine booting up?): {e}")
+
     yolo_model = YOLO("yolo11n.pt")
     stream_bridge = LowLatencyRingBuffer(RTSP_URL).start()
     threading.Thread(target=background_ai_inference_worker, daemon=True).start()
     print("[🚀] Headless AI Geometric Action Matrix Engaged Flawlessly.")
+    yield
+    # Cleanup stream components gracefully on host stop sequence
+    if stream_bridge:
+        stream_bridge.running = False
 
-def query_db(sql, params=()):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute(sql, params)
-    data = cursor.fetchall()
-    conn.close()
-    return data
+app = FastAPI(title="V380 Pro AI Analytics Center", lifespan=lifespan)
 
 # --- WEB APPLICATION BACKEND ENDPOINTS ---
 @app.get("/video_feed")
@@ -288,14 +314,10 @@ def get_chart_data_endpoint():
 @app.post("/api/chat")
 def chatbot_endpoint(user_message: str = Form(...)):
     try:
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        cursor.execute("""
+        rows = query_db("""
             SELECT timestamp, target_class, action_defined, duration_secs
             FROM security_logs ORDER BY id DESC LIMIT 15
         """)
-        rows = cursor.fetchall()
-        conn.close()
 
         sanitized_timeline_context = sanitize_telemetry_logs(rows) if rows else "The camera tracking logs are currently empty."
 
@@ -327,7 +349,7 @@ def chatbot_endpoint(user_message: str = Form(...)):
     except requests.exceptions.Timeout:
         return {"response": "[⏳] Chat request timed out. Llama 3.2 is taking too long to wake up or process tensors on your system hardware."}
     except requests.exceptions.ConnectionError:
-        return {"response": "[❌] Connection Refused: Could not reach Ollama. Please ensure your native engine service is active via 'sudo systemctl start ollama'."}
+        return {"response": "[❌] Connection Refused: Could not reach Ollama. Please ensure your native engine service is active."}
     except Exception as e:
         return {"response": f"Chat engine exception caught: {e}"}
 
