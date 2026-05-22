@@ -61,93 +61,117 @@ class LowLatencyRingBuffer:
             return True, self.buffer[0].copy()
         return False, None
 
-# --- RELATIONAL STORAGE SCHEMA & TRANSACTIONS ---
+# --- RELATIONAL STORAGE SCHEMA & TRANSACTIONS (WAL OPTIMIZED) ---
 def init_db():
-    # Set timeout to handle concurrent background locks gracefully
-    conn = sqlite3.connect(DB_FILE, timeout=10.0)
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS security_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT DEFAULT (datetime('now', 'localtime')),
-            target_class TEXT,
-            action_defined TEXT,
-            peak_confidence REAL,
-            duration_secs REAL
-        )
-    """)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_target ON security_logs(target_class)")
-    conn.commit()
-    conn.close()
+    with sqlite3.connect(DB_FILE, timeout=15.0) as conn:
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL;")
+        cursor.execute("PRAGMA synchronous=NORMAL;")
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS security_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT DEFAULT (datetime('now', 'localtime')),
+                target_class TEXT,
+                action_defined TEXT,
+                peak_confidence REAL,
+                duration_secs REAL
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_target ON security_logs(target_class)")
 
 def log_event_to_db(target, action, confidence, duration):
-    conn = sqlite3.connect(DB_FILE, timeout=10.0)
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO security_logs (target_class, action_defined, peak_confidence, duration_secs)
-        VALUES (?, ?, ?, ?)
-    """, (target, action, round(confidence, 2), round(duration, 1)))
-    conn.commit()
-    conn.close()
+    with sqlite3.connect(DB_FILE, timeout=15.0) as conn:
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL;")
+        cursor.execute("""
+            INSERT INTO security_logs (target_class, action_defined, peak_confidence, duration_secs)
+            VALUES (?, ?, ?, ?)
+        """, (target, action, round(confidence, 2), round(duration, 1)))
 
 def query_db(sql, params=()):
-    conn = sqlite3.connect(DB_FILE, timeout=10.0)
-    cursor = conn.cursor()
-    cursor.execute(sql, params)
-    data = cursor.fetchall()
-    conn.close()
-    return data
+    with sqlite3.connect(DB_FILE, timeout=15.0) as conn:
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL;")
+        cursor.execute(sql, params)
+        return cursor.fetchall()
 
 # --- SPATIAL GEOMETRY & TELEMETRY PROCESSING ---
 class AdvancedSpatialTracker:
     def __init__(self, target_name):
         self.target_name = target_name
-        self.is_active = False
-        self.start_time = 0.0
-        self.peak_confidence = 0.0
-        self.history = deque(maxlen=10)
-        self.current_action = "Calibrating"
+        self.active_tracks = {}
 
-    def process(self, is_visible, current_conf, box_coords=None):
-        if is_visible and box_coords is not None:
-            self.peak_confidence = max(self.peak_confidence, current_conf)
-            x1, y1, x2, y2 = box_coords
-            w = x2 - x1
-            h = y2 - y1
-            cx = x1 + (w / 2)
-            cy = y1 + (h / 2)
+    def process_frame_tracks(self, current_frame_detections):
+        now = time.time()
+        
+        for det in current_frame_detections:
+            tid = det["track_id"]
+            conf = det["conf"]
+            x1, y1, x2, y2 = det["box"]
+            
+            w, h = x2 - x1, y2 - y1
+            cx, cy = x1 + (w / 2), y1 + (h / 2)
             aspect_ratio = w / float(h) if h > 0 else 0
 
-            self.history.append({"cx": cx, "cy": cy, "ar": aspect_ratio, "h": h})
+            if tid not in self.active_tracks:
+                self.active_tracks[tid] = {
+                    "start_time": now,
+                    "last_seen": now,
+                    "peak_confidence": conf,
+                    "current_action": "Calibrating",
+                    "last_state_change": now,
+                    "history": deque(maxlen=15)
+                }
 
-            if len(self.history) == self.history.maxlen:
+            track = self.active_tracks[tid]
+            track["last_seen"] = now
+            track["peak_confidence"] = max(track["peak_confidence"], conf)
+            track["history"].append({"cx": cx, "cy": cy, "ar": aspect_ratio, "h": h})
+
+            if len(track["history"]) == track["history"].maxlen and (now - track["last_state_change"] > 1.5):
+                proposed_action = track["current_action"]
+                
                 if self.target_name == "Human":
-                    avg_ar = sum(f["ar"] for f in self.history) / len(self.history)
-                    if avg_ar > 0.72:
-                        self.current_action = "Sitting/Working"
+                    avg_ar = sum(f["ar"] for f in track["history"]) / len(track["history"])
+                    dx = abs(track["history"][-1]["cx"] - track["history"][0]["cx"]) / h
+                    dy = abs(track["history"][-1]["cy"] - track["history"][0]["cy"]) / h
+                    total_velocity = dx + dy
+
+                    if total_velocity > 0.18:
+                        proposed_action = "Standing/Moving"
+                    elif avg_ar > 0.72:
+                        proposed_action = "Sitting/Working"
                     else:
-                        self.current_action = "Standing/Moving"
+                        proposed_action = "Stationary/Standing"
+                        
                 elif self.target_name == "Doggo":
-                    dx = abs(self.history[-1]["cx"] - self.history[0]["cx"])
-                    dy = abs(self.history[-1]["cy"] - self.history[0]["cy"])
+                    dx = abs(track["history"][-1]["cx"] - track["history"][0]["cx"])
+                    dy = abs(track["history"][-1]["cy"] - track["history"][0]["cy"])
                     total_velocity = dx + dy
 
                     if total_velocity > 40:
-                        self.current_action = "Pacing/Moving"
+                        proposed_action = "Pacing/Moving"
                     else:
-                        self.current_action = "Bedded/Sleeping"
+                        proposed_action = "Bedded/Sleeping"
 
-            if not self.is_active:
-                self.is_active = True
-                self.start_time = time.time()
-        else:
-            if self.is_active:
-                duration = time.time() - self.start_time
-                self.is_active = False
-                log_event_to_db(self.target_name, self.current_action, self.peak_confidence, duration)
-                self.peak_confidence = 0.0
-                self.history.clear()
-                self.current_action = "Calibrating"
+                if proposed_action != track["current_action"]:
+                    track["current_action"] = proposed_action
+                    track["last_state_change"] = now
+
+        stale_ids = [tid for tid, t_meta in self.active_tracks.items() if now - t_meta["last_seen"] > 2.0]
+        for tid in stale_ids:
+            t_meta = self.active_tracks[tid]
+            duration = t_meta["last_seen"] - t_meta["start_time"]
+            
+            if duration > 1.5 and t_meta["current_action"] != "Calibrating":
+                log_event_to_db(self.target_name, t_meta["current_action"], t_meta["peak_confidence"], duration)
+            
+            del self.active_tracks[tid]
+
+    def get_current_action(self, track_id):
+        if track_id in self.active_tracks:
+            return self.active_tracks[track_id]["current_action"]
+        return "Calibrating"
 
 stream_bridge = None
 yolo_model = None
@@ -162,19 +186,35 @@ def sanitize_telemetry_logs(rows):
         "Calibrating": "entering or settling into the room briefly",
         "Sitting/Working": "sitting down at the desk working",
         "Standing/Moving": "standing or walking around the room",
+        "Stationary/Standing": "standing completely still inside the room",
         "Pacing/Moving": "actively pacing around the room",
         "Bedded/Sleeping": "lying down on the floor resting or sleeping"
     }
 
-    clean_text = ""
-    for r in reversed(rows):
+    if not rows:
+        return "The camera tracking logs are currently empty."
+
+    # Group consecutive identical target + action events together
+    compressed_events = []
+    for r in reversed(rows): # Read chronologically
         timestamp, target, action, duration = r
         friendly_action = translation_layer.get(action, action.lower())
-
-        if target == "Human":
-            clean_text += f"- At {timestamp}, a human was detected {friendly_action} for {duration} seconds.\n"
+        
+        if compressed_events and compressed_events[-1]['target'] == target and compressed_events[-1]['friendly_action'] == friendly_action:
+            # If the same subject is doing the same thing consecutively, accumulate the duration
+            compressed_events[-1]['duration'] += duration
         else:
-            clean_text += f"- At {timestamp}, a dog was tracked {friendly_action} for {duration} seconds.\n"
+            compressed_events.append({
+                "timestamp": timestamp,
+                "target": "human" if target == "Human" else "dog",
+                "friendly_action": friendly_action,
+                "duration": duration
+            })
+
+    clean_text = ""
+    for event in compressed_events:
+        clean_text += f"- At {event['timestamp']}, a {event['target']} was detected {event['friendly_action']} for approximately {round(event['duration'], 1)} total seconds.\n"
+    
     return clean_text
 
 # --- BACKGROUND COMPUTER VISION WORKER ---
@@ -188,42 +228,44 @@ def background_ai_inference_worker():
             time.sleep(0.01)
             continue
 
-        results = yolo_model.predict(frame, device="cpu", verbose=False, imgsz=640)[0]
+        results = yolo_model.track(frame, persist=True, device="cpu", verbose=False, imgsz=640)[0]
 
-        f_human, f_dog = False, False
-        h_conf, d_conf = 0.0, 0.0
-        h_box, d_box = None, None
+        human_detections_this_frame = []
+        dog_detections_this_frame = []
 
-        for box in results.boxes:
-            cls_id = int(box.cls[0])
-            conf = float(box.conf[0])
+        if results.boxes is not None and len(results.boxes) > 0:
+            for box in results.boxes:
+                cls_id = int(box.cls[0])
+                conf = float(box.conf[0])
 
-            if cls_id in [0, 16] and conf > 0.60:
-                is_human = (cls_id == 0)
-                coords = map(int, box.xyxy[0])
-                x1, y1, x2, y2 = coords
+                if cls_id in [0, 16] and conf > 0.60 and box.id is not None:
+                    is_human = (cls_id == 0)
+                    track_id = int(box.id[0])
+                    coords = list(map(int, box.xyxy[0]))
+                    x1, y1, x2, y2 = coords
 
-                if is_human:
-                    f_human = True
-                    h_conf = max(h_conf, conf)
-                    h_box = (x1, y1, x2, y2)
-                else:
-                    f_dog = True
-                    d_conf = max(d_conf, conf)
-                    d_box = (x1, y1, x2, y2)
+                    det_payload = {"track_id": track_id, "conf": conf, "box": (x1, y1, x2, y2)}
+                    
+                    if is_human:
+                        human_detections_this_frame.append(det_payload)
+                    else:
+                        dog_detections_this_frame.append(det_payload)
 
-                act_label = human_tracker.current_action if is_human else dog_tracker.current_action
-                color = (0, 0, 255) if is_human else (0, 255, 0)
-                lbl = f"{'Human' if is_human else 'Doggo'} ({act_label}): {conf:.2f}"
+                    tracker_instance = human_tracker if is_human else dog_tracker
+                    act_label = tracker_instance.get_current_action(track_id)
+                    
+                    color = (0, 0, 255) if is_human else (0, 255, 0)
+                    lbl = f"{'Human' if is_human else 'Doggo'} #{track_id} ({act_label}): {conf:.2f}"
 
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                cv2.putText(frame, lbl, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                    cv2.putText(frame, lbl, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-        human_tracker.process(f_human, h_conf, h_box)
-        dog_tracker.process(f_dog, d_conf, d_box)
+        human_tracker.process_frame_tracks(human_detections_this_frame)
+        dog_tracker.process_frame_tracks(dog_detections_this_frame)
 
-        txt = "SYSTEM MONITOR: " + ("Tracking Metrics Active" if (f_human or f_dog) else "Clear")
-        clr = (0, 0, 255) if f_human else (0, 255, 0) if f_dog else (255, 165, 0)
+        system_active = len(human_detections_this_frame) > 0 or len(dog_detections_this_frame) > 0
+        txt = "SYSTEM MONITOR: " + ("Tracking Metrics Active" if system_active else "Clear")
+        clr = (0, 0, 255) if len(human_detections_this_frame) > 0 else (0, 255, 0) if len(dog_detections_this_frame) > 0 else (255, 165, 0)
         cv2.putText(frame, txt, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, clr, 2)
 
         with frame_lock:
@@ -239,22 +281,19 @@ async def lifespan(app: FastAPI):
     global stream_bridge, yolo_model
     init_db()
     
-    # Auto-synchronize Llama weights on container initialization
     try:
         print("[🤖] Checking local Ollama engine model layer...")
         pull_url = f"{OLLAMA_BASE.rstrip('/')}/api/pull"
-        # Increase timeout slightly to allow a pull verification check response
         requests.post(pull_url, json={"name": "llama3.2:1b"}, timeout=10)
         print("[✅] Local Llama 3.2:1b layer synchronized successfully.")
     except Exception as e:
         print(f"[⚠️] Model verification failed (Is Ollama engine booting up?): {e}")
 
-    yolo_model = YOLO("yolo11n.pt")
+    yolo_model = YOLO("yolo11n_openvino_model/")
     stream_bridge = LowLatencyRingBuffer(RTSP_URL).start()
     threading.Thread(target=background_ai_inference_worker, daemon=True).start()
     print("[🚀] Headless AI Geometric Action Matrix Engaged Flawlessly.")
     yield
-    # Cleanup stream components gracefully on host stop sequence
     if stream_bridge:
         stream_bridge.running = False
 
@@ -375,7 +414,8 @@ def serve_dashboard():
         for row in recent_logs
     ]) or "<tr><td colspan='5'>Awaiting operational sequences...</td></tr>"
 
-    html_content = f"""
+    # CRITICAL SECURITY FIX: Use a normal triple-quote string without the f-prefix to bypass bracket parsing collision.
+    html_template = """
     <!DOCTYPE html>
     <html>
     <head>
@@ -384,18 +424,18 @@ def serve_dashboard():
         <link rel='stylesheet' href='https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css'>
         <script src='https://cdn.jsdelivr.net/npm/chart.js'></script>
         <style>
-            body {{ background-color: #121214; color: #e1e1e6; font-family: sans-serif; padding: 20px 0; }}
-            .card {{ background-color: #202024; border: 1px solid #323238; margin-bottom: 20px; }}
-            .table {{ color: #e1e1e6; border-color: #323238; }}
-            th {{ color: #8d8d99 !important; }}
-            .badge.human {{ background-color: #f75a68; }}
-            .badge.doggo {{ background-color: #00b37e; }}
-            .live-feed {{ max-width: 100%; height: auto; border: 2px solid #323238; }}
-            canvas {{ max-height: 240px; width: 100% !important; }}
-            .chat-box {{ height: 260px; overflow-y: auto; background-color: #1a1a1e; border: 1px solid #29292e; padding: 15px; border-radius: 6px; }}
-            .msg {{ margin-bottom: 12px; padding: 8px 12px; border-radius: 8px; max-width: 85%; display: inline-block; }}
-            .msg.user {{ background-color: #29292e; color: #e1e1e6; float: right; clear: both; }}
-            .msg.ai {{ background-color: #00b37e; color: #121214; font-weight: 500; float: left; clear: both; }}
+            body { background-color: #121214; color: #e1e1e6; font-family: sans-serif; padding: 20px 0; }
+            .card { background-color: #202024; border: 1px solid #323238; margin-bottom: 20px; }
+            .table { color: #e1e1e6; border-color: #323238; }
+            th { color: #8d8d99 !important; }
+            .badge.human { background-color: #f75a68; }
+            .badge.doggo { background-color: #00b37e; }
+            .live-feed { max-width: 100%; height: auto; border: 2px solid #323238; }
+            canvas { max-height: 240px; width: 100% !important; }
+            .chat-box { height: 260px; overflow-y: auto; background-color: #1a1a1e; border: 1px solid #29292e; padding: 15px; border-radius: 6px; }
+            .msg { margin-bottom: 12px; padding: 8px 12px; border-radius: 8px; max-width: 85%; display: inline-block; }
+            .msg.user { background-color: #29292e; color: #e1e1e6; float: right; clear: both; }
+            .msg.ai { background-color: #00b37e; color: #121214; font-weight: 500; float: left; clear: both; }
         </style>
     </head>
     <body>
@@ -420,7 +460,7 @@ def serve_dashboard():
                             <thead>
                                 <tr><th>Profile</th><th>Action State</th><th>Total Events</th><th>Avg Duration</th></tr>
                             </thead>
-                            <tbody>{summary_rows}</tbody>
+                            <tbody>{SUMMARY_ROWS}</tbody>
                         </table>
                     </div>
 
@@ -430,7 +470,7 @@ def serve_dashboard():
                             <thead>
                                 <tr><th>Timestamp</th><th>Profile</th><th>Action Defined</th><th>Accuracy</th><th>Duration</th></tr>
                             </thead>
-                            <tbody>{recent_rows}</tbody>
+                            <tbody>{RECENT_ROWS}</tbody>
                         </table>
                     </div>
                 </div>
@@ -472,65 +512,65 @@ def serve_dashboard():
             let hourlyChartInstance = null;
             let compositionChartInstance = null;
 
-            async function renderAnalyticsCharts() {{
-                try {{
+            async function renderAnalyticsCharts() {
+                try {
                     const response = await fetch('/api/chart_data');
                     const data = await response.json();
 
                     if (hourlyChartInstance) hourlyChartInstance.destroy();
                     if (compositionChartInstance) compositionChartInstance.destroy();
 
-                    hourlyChartInstance = new Chart(document.getElementById('hourlyChart'), {{
+                    hourlyChartInstance = new Chart(document.getElementById('hourlyChart'), {
                         type: 'bar',
-                        data: {{
+                        data: {
                             labels: data.hourly_labels,
-                            datasets: [{{
+                            datasets: [{
                                 label: 'Activity Logs Count',
                                 data: data.hourly_values,
                                 backgroundColor: '#00b37e',
                                 borderColor: '#00e6a0',
                                 borderWidth: 1
-                            }}]
-                        }},
-                        options: {{
+                            }]
+                        },
+                        options: {
                             responsive: true,
                             maintainAspectRatio: false,
-                            plugins: {{ legend: {{ display: false }} }},
-                            scales: {{
-                                x: {{ ticks: {{ color: '#8d8d99' }}, grid: {{ color: '#29292e' }} }},
-                                y: {{ ticks: {{ color: '#8d8d99', stepSize: 1 }}, grid: {{ color: '#29292e' }} }}
-                            }}
-                        }}
-                    }});
+                            plugins: { legend: { display: false } },
+                            scales: {
+                                x: { ticks: { color: '#8d8d99' }, grid: { color: '#29292e' } },
+                                y: { ticks: { color: '#8d8d99', stepSize: 1 }, grid: { color: '#29292e' } }
+                            }
+                        }
+                    });
 
-                    compositionChartInstance = new Chart(document.getElementById('compositionChart'), {{
+                    compositionChartInstance = new Chart(document.getElementById('compositionChart'), {
                         type: 'pie',
-                        data: {{
+                        data: {
                             labels: data.comp_labels,
-                            datasets: [{{
+                            datasets: [{
                                 data: data.comp_values,
                                 backgroundColor: ['#f75a68', '#00b37e'],
                                 borderWidth: 0
-                            }}]
-                        }},
-                        options: {{
+                            }]
+                        },
+                        options: {
                             responsive: true,
                             maintainAspectRatio: false,
-                            plugins: {{ legend: {{ labels: {{ color: '#e1e1e6' }} }} }}
-                        }}
-                    }});
-                }} catch (error) {{
+                            plugins: { legend: { labels: { color: '#e1e1e6' } } }
+                        }
+                    });
+                } catch (error) {
                     console.error("Error fetching or rendering analytics charts:", error);
-                }}
-            }}
+                }
+            }
 
-            async function submitChatRequest(e) {{
+            async function submitChatRequest(e) {
                 e.preventDefault();
                 const inputEl = document.getElementById('userInput');
                 const boxEl = document.getElementById('chatBox');
                 const msgText = inputEl.value;
 
-                if (msgText.trim() !== "") {{
+                if (msgText.trim() !== "") {
                     boxEl.innerHTML += "<div class='msg user'>" + msgText + "</div>";
                     inputEl.value = "";
                     boxEl.scrollTop = boxEl.scrollHeight;
@@ -539,29 +579,31 @@ def serve_dashboard():
                     boxEl.innerHTML += "<div class='msg ai' id='" + loadId + "'>Processing query...</div>";
                     boxEl.scrollTop = boxEl.scrollHeight;
 
-                    try {{
+                    try {
                         const formData = new FormData();
                         formData.append("user_message", msgText);
 
-                        const response = await fetch('/api/chat', {{ method: 'POST', body: formData }});
+                        const response = await fetch('/api/chat', { method: 'POST', body: formData });
                         const resData = await response.json();
 
                         document.getElementById(loadId).innerText = resData.response;
-                    }} catch(err) {{
+                    } catch(err) {
                         document.getElementById(loadId).innerText = "Unable to connect to local language model service.";
-                    }}
+                    }
                     boxEl.scrollTop = boxEl.scrollHeight;
-                }}
-            }}
+                }
+            }
 
-            window.onload = async () => {{
+            window.onload = async () => {
                 await renderAnalyticsCharts();
-            }};
+            };
         </script>
     </body>
     </html>
     """
-    return html_content
+    
+    # Safely swap out variables without colliding with native JavaScript braces
+    return html_template.replace("{SUMMARY_ROWS}", summary_rows).replace("{RECENT_ROWS}", recent_rows)
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8050)
