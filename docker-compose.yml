@@ -9,8 +9,8 @@ services:
     volumes:
       - ./v380_analytics.db:/app/v380_analytics.db
     environment:
-	  - RTSP_URL=${RTSP_URL}
-	  - OLLAMA_URL=http://ollama_engine:11434
+      - RTSP_URL=${RTSP_URL}
+      - OLLAMA_URL=http://ollama_engine:11434
     depends_on:
       - ollama_engine
     restart: unless-stopped
