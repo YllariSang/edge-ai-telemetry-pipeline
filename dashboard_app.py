@@ -41,10 +41,14 @@ class LowLatencyRingBuffer:
         return self
 
     def _capture_worker(self):
+        consecutive_failures = 0
         while self.running:
             if not self.cap.isOpened():
-                print("[⚠️] Camera disconnected. Attempting reconnection in 5 seconds...")
-                time.sleep(5)
+                # Exponential back-off up to 60 seconds to protect CPU when camera is offline long-term
+                sleep_time = min(2 ** consecutive_failures, 60)
+                print(f"[⚠️] Camera disconnected. Attempting reconnection in {sleep_time} seconds...")
+                time.sleep(sleep_time)
+                consecutive_failures += 1
                 self.cap.open(self.src)
                 continue
                 
@@ -52,6 +56,7 @@ class LowLatencyRingBuffer:
             if ret:
                 self.ret = ret
                 self.buffer.append(frame)
+                consecutive_failures = 0  # Reset backoff tracking on a valid frame receipt
             else:
                 print("[⚠️] Frame drop or stream interruption detected. Reinitializing link...")
                 self.cap.release()
@@ -114,11 +119,13 @@ class AdvancedSpatialTracker:
         self.target_name = target_name
         self.active_tracks = {}
         self.lock = threading.Lock()
+        self.id_lost_grace_period = 2.0  # Seconds to wait before assuming a missing object is permanently gone
 
     def process_frame_tracks(self, current_frame_detections):
         now = time.time()
         
         with self.lock:
+            # Process targets detected in the current frame
             for det in current_frame_detections:
                 tid = det["track_id"]
                 conf = det["conf"]
@@ -173,9 +180,11 @@ class AdvancedSpatialTracker:
                         track["current_action"] = proposed_action
                         track["last_state_change"] = now
 
-            stale_ids = [tid for tid, t_meta in self.active_tracks.items() if now - t_meta["last_seen"] > 2.0]
+            # Identify stale tracks exceeding the grace period limit
+            stale_ids = [tid for tid, t_meta in self.active_tracks.items() if now - t_meta["last_seen"] > self.id_lost_grace_period]
             for tid in stale_ids:
                 t_meta = self.active_tracks[tid]
+                # Calculate duration up until the last true frame visualization instance
                 duration = t_meta["last_seen"] - t_meta["start_time"]
                 
                 if duration > 1.5 and t_meta["current_action"] != "Calibrating":
@@ -288,19 +297,34 @@ def background_ai_inference_worker():
         time.sleep(sleep_t)
 
 def sync_ollama_models():
+    base_url = OLLAMA_BASE.rstrip('/')
+    max_retries = 6
+    retry_delay = 5
+    connected = False
+
+    print(f"[🤖] Initiating pre-flight verification on Ollama host: {base_url}")
+    
+    for attempt in range(1, max_retries + 1):
+        try:
+            requests.get(base_url, timeout=3)
+            connected = True
+            print(f"[🤖] Successfully established link to Ollama endpoint on attempt {attempt}.")
+            break
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+            print(f"[⏳] Ollama container service is initializing... (Attempt {attempt}/{max_retries} failed. Retrying in {retry_delay}s)")
+            time.sleep(retry_delay)
+
+    if not connected:
+        print("[❌] Pre-flight Check Failed: Ollama host could not be reached. Automated pulling skipped.")
+        return
+
     try:
-        base_url = OLLAMA_BASE.rstrip('/')
-        print(f"[🤖] Pinging Ollama host endpoint at: {base_url}")
-        requests.get(base_url, timeout=3)
-        
         pull_url = f"{base_url}/api/pull"
         print("[🤖] Connection active. Synchronizing Llama 3.2:1b weights...")
         requests.post(pull_url, json={"name": "llama3.2:1b"}, timeout=15)
         print("[✅] Local model synchronization complete.")
-    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
-        print("[❌] Pre-flight Check Failed: Ollama backend service is dead, unresponsive, or running on an alternate port.")
     except Exception as e:
-        print(f"[⚠️] Unexpected engine alert encountered: {e}")
+        print(f"[⚠️] Unexpected engine alert encountered during model initialization: {e}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -463,6 +487,7 @@ def serve_dashboard():
             .msg { margin-bottom: 12px; padding: 8px 12px; border-radius: 8px; max-width: 85%; display: inline-block; }
             .msg.user { background-color: #29292e; color: #e1e1e6; float: right; clear: both; }
             .msg.ai { background-color: #00b37e; color: #121214; font-weight: 500; float: left; clear: both; }
+            .chart-placeholder { height: 240px; display: flex; align-items: center; justify-content: center; color: #8d8d99; font-style: italic; }
         </style>
     </head>
     <body>
@@ -522,13 +547,17 @@ def serve_dashboard():
                 <div class='col-md-8'>
                     <div class='card shadow-sm p-4'>
                         <h5 class='text-info mb-3'>Hourly Activity Distribution Map</h5>
-                        <canvas id='hourlyChart'></canvas>
+                        <div id='hourlyContainer'>
+                            <canvas id='hourlyChart'></canvas>
+                        </div>
                     </div>
                 </div>
                 <div class='col-md-4'>
                     <div class='card shadow-sm p-4'>
                         <h5 class='text-info mb-3'>Target Tracking Profiles Split</h5>
-                        <canvas id='compositionChart'></canvas>
+                        <div id='compositionContainer'>
+                            <canvas id='compositionChart'></canvas>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -544,6 +573,15 @@ def serve_dashboard():
                 try {
                     const response = await fetch('/api/chart_data');
                     const data = await response.json();
+
+                    const totalHourlyEvents = data.hourly_values.reduce((a, b) => a + b, 0);
+
+                    // Check if database metrics are completely empty
+                    if (totalHourlyEvents === 0) {
+                        document.getElementById('hourlyContainer').innerHTML = "<div class='chart-placeholder'>Awaiting room tracking metrics data logs...</div>";
+                        document.getElementById('compositionContainer').innerHTML = "<div class='chart-placeholder'>Awaiting profile distributions...</div>";
+                        return;
+                    }
 
                     if (hourlyChartInstance) hourlyChartInstance.destroy();
                     if (compositionChartInstance) compositionChartInstance.destroy();
@@ -601,13 +639,19 @@ def serve_dashboard():
                 if (msgText !== "") {
                     boxEl.innerHTML += "<div class='msg user'>" + msgText + "</div>";
                     inputEl.value = "";
-                    boxEl.scrollTop = boxEl.scrollHeight;
+                    
+                    setTimeout(() => { boxEl.scrollTop = boxEl.scrollHeight; }, 10);
 
                     conversationHistory.push({ role: "user", content: msgText });
 
+                    // Sliding Context Window: Keep only the last 20 messages to prevent payload bloat or memory leaks
+                    if (conversationHistory.length > 20) {
+                        conversationHistory = conversationHistory.slice(-20);
+                    }
+
                     const loadId = "load_" + Date.now();
                     boxEl.innerHTML += "<div class='msg ai' id='" + loadId + "'>Processing query...</div>";
-                    boxEl.scrollTop = boxEl.scrollHeight;
+                    setTimeout(() => { boxEl.scrollTop = boxEl.scrollHeight; }, 10);
 
                     try {
                         const formData = new FormData();
@@ -621,7 +665,9 @@ def serve_dashboard():
                     } catch(err) {
                         document.getElementById(loadId).innerText = "Unable to connect to local language model service.";
                     }
-                    boxEl.scrollTop = boxEl.scrollHeight;
+                    
+                    // Force clean scroll bounding alignment after DOM layout updates resolve
+                    setTimeout(() => { boxEl.scrollTop = boxEl.scrollHeight; }, 50);
                 }
             }
 
