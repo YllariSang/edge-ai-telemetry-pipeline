@@ -11,8 +11,12 @@ from fastapi import FastAPI, responses, Form, Request
 import uvicorn
 from contextlib import asynccontextmanager
 
+# Local runtime path variables
 DB_FILE = "v380_analytics.db"
 AI_DETECTION_INTERVAL = 0.2
+
+# Extract hardcoded AI profiles into cleaner global constants
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:1b")
 
 raw_device = os.getenv("YOLO_DEVICE", "cpu").lower().strip()
 if raw_device == "gpu":
@@ -44,9 +48,8 @@ class LowLatencyRingBuffer:
         consecutive_failures = 0
         while self.running:
             if not self.cap.isOpened():
-                # Exponential back-off up to 60 seconds to protect CPU when camera is offline long-term
                 sleep_time = min(2 ** consecutive_failures, 60)
-                print(f"[⚠️] Camera disconnected. Attempting reconnection in {sleep_time} seconds...")
+                print(f"[⚠️] Camera connection down. Attempting re-initialization in {sleep_time} seconds...")
                 time.sleep(sleep_time)
                 consecutive_failures += 1
                 self.cap.open(self.src)
@@ -56,11 +59,13 @@ class LowLatencyRingBuffer:
             if ret:
                 self.ret = ret
                 self.buffer.append(frame)
-                consecutive_failures = 0  # Reset backoff tracking on a valid frame receipt
+                consecutive_failures = 0  
             else:
-                print("[⚠️] Frame drop or stream interruption detected. Reinitializing link...")
+                consecutive_failures += 1
+                sleep_time = min(2 ** consecutive_failures, 60)
+                print(f"[⚠️] Frame drop or read failure ({consecutive_failures}). Cool-down for {sleep_time}s before link reset...")
                 self.cap.release()
-                time.sleep(2)
+                time.sleep(sleep_time)
                 self.cap.open(self.src)
 
     def get_frame(self):
@@ -119,13 +124,12 @@ class AdvancedSpatialTracker:
         self.target_name = target_name
         self.active_tracks = {}
         self.lock = threading.Lock()
-        self.id_lost_grace_period = 2.0  # Seconds to wait before assuming a missing object is permanently gone
+        self.id_lost_grace_period = 2.0  
 
     def process_frame_tracks(self, current_frame_detections):
         now = time.time()
         
         with self.lock:
-            # Process targets detected in the current frame
             for det in current_frame_detections:
                 tid = det["track_id"]
                 conf = det["conf"]
@@ -180,11 +184,9 @@ class AdvancedSpatialTracker:
                         track["current_action"] = proposed_action
                         track["last_state_change"] = now
 
-            # Identify stale tracks exceeding the grace period limit
             stale_ids = [tid for tid, t_meta in self.active_tracks.items() if now - t_meta["last_seen"] > self.id_lost_grace_period]
             for tid in stale_ids:
                 t_meta = self.active_tracks[tid]
-                # Calculate duration up until the last true frame visualization instance
                 duration = t_meta["last_seen"] - t_meta["start_time"]
                 
                 if duration > 1.5 and t_meta["current_action"] != "Calibrating":
@@ -311,7 +313,7 @@ def sync_ollama_models():
             print(f"[🤖] Successfully established link to Ollama endpoint on attempt {attempt}.")
             break
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
-            print(f"[⏳] Ollama container service is initializing... (Attempt {attempt}/{max_retries} failed. Retrying in {retry_delay}s)")
+            print(f"[⏳] Ollama service is initializing... (Attempt {attempt}/{max_retries} failed. Retrying in {retry_delay}s)")
             time.sleep(retry_delay)
 
     if not connected:
@@ -320,8 +322,9 @@ def sync_ollama_models():
 
     try:
         pull_url = f"{base_url}/api/pull"
-        print("[🤖] Connection active. Synchronizing Llama 3.2:1b weights...")
-        requests.post(pull_url, json={"name": "llama3.2:1b"}, timeout=15)
+        print(f"[🤖] Connection active. Synchronizing {OLLAMA_MODEL} weights...")
+        # Replaced hardcoded string with dynamic context variable configuration
+        requests.post(pull_url, json={"name": OLLAMA_MODEL}, timeout=None)
         print("[✅] Local model synchronization complete.")
     except Exception as e:
         print(f"[⚠️] Unexpected engine alert encountered during model initialization: {e}")
@@ -394,11 +397,33 @@ def get_chart_data_endpoint():
         if row[0] == "Human": comp_dict["Human"] = row[1]
         elif row[0] == "Doggo": comp_dict["Doggo"] = row[1]
 
+    # Added summary and recent rows endpoints to service the dynamic frontend repainting handler
+    summary_data = query_db("""
+        SELECT target_class, action_defined, COUNT(*), AVG(duration_secs)
+        FROM security_logs GROUP BY target_class, action_defined
+    """)
+    recent_logs = query_db("""
+        SELECT timestamp, target_class, action_defined, peak_confidence, duration_secs
+        FROM security_logs ORDER BY id DESC LIMIT 5
+    """)
+
+    summary_rows = "".join([
+        f"<tr><td>{row[0]}</td><td><span class='badge bg-secondary'>{row[1]}</span></td><td><b>{row[2]}</b></td><td>{row[3]:.1f}s</td></tr>"
+        for row in summary_data
+    ]) or "<tr><td colspan='4'>No behavioral tracking metrics accumulated yet.</td></tr>"
+
+    recent_rows = "".join([
+        f"<tr><td>{row[0]}</td><td><span class='badge {row[1].lower()}'>{row[1]}</span></td><td><small>{row[2]}</small></td><td>{row[3]*100:.0f}%</td><td>{row[4]:.1f}s</td></tr>"
+        for row in recent_logs
+    ]) or "<tr><td colspan='5'>Awaiting operational sequences...</td></tr>"
+
     return {
         "hourly_labels": list(hourly_dict.keys()),
         "hourly_values": list(hourly_dict.values()),
         "comp_labels": list(comp_dict.keys()),
-        "comp_values": list(comp_dict.values())
+        "comp_values": list(comp_dict.values()),
+        "summary_rows_html": summary_rows,
+        "recent_rows_html": recent_rows
     }
 
 @app.post("/api/chat")
@@ -426,7 +451,7 @@ def chatbot_endpoint(history: str = Form(...)):
             messages.append({"role": msg["role"], "content": msg["content"]})
 
         payload = {
-            "model": "llama3.2:1b",
+            "model": OLLAMA_MODEL, # Set dynamically from global profile definition configurations
             "messages": messages,
             "stream": False
         }
@@ -439,7 +464,7 @@ def chatbot_endpoint(history: str = Form(...)):
     except json.JSONDecodeError:
         return {"response": "[❌] Content Malformed: Failed to cleanly reconstruct conversation context metadata."}
     except requests.exceptions.Timeout:
-        return {"response": "[⏳] Chat request timed out. Llama 3.2 is taking too long to wake up or process tensors on your system hardware."}
+        return {"response": f"[⏳] Chat request timed out. {OLLAMA_MODEL} is taking too long to process parameters."}
     except requests.exceptions.ConnectionError:
         return {"response": "[❌] Connection Refused: Could not reach Ollama. Please ensure your native engine service is active."}
     except Exception as e:
@@ -512,7 +537,7 @@ def serve_dashboard():
                             <thead>
                                 <tr><th>Profile</th><th>Action State</th><th>Total Events</th><th>Avg Duration</th></tr>
                             </thead>
-                            <tbody>{SUMMARY_ROWS}</tbody>
+                            <tbody id="summaryTableBody">{SUMMARY_ROWS}</tbody>
                         </table>
                     </div>
 
@@ -522,7 +547,7 @@ def serve_dashboard():
                             <thead>
                                 <tr><th>Timestamp</th><th>Profile</th><th>Action Defined</th><th>Accuracy</th><th>Duration</th></tr>
                             </thead>
-                            <tbody>{RECENT_ROWS}</tbody>
+                            <tbody id="recentTableBody">{RECENT_ROWS}</tbody>
                         </table>
                     </div>
                 </div>
@@ -561,7 +586,7 @@ def serve_dashboard():
                     </div>
                 </div>
             </div>
-            <button class='btn btn-outline-secondary btn-sm' onclick='window.location.reload()'>Refresh View Metrics</button>
+            <button class='btn btn-outline-secondary btn-sm' onclick='renderAnalyticsCharts()'>Refresh View Metrics</button>
         </div>
 
         <script>
@@ -574,13 +599,24 @@ def serve_dashboard():
                     const response = await fetch('/api/chart_data');
                     const data = await response.json();
 
+                    // Update metrics table content asynchronously without disrupting ongoing chat session context 
+                    if(data.summary_rows_html) document.getElementById('summaryTableBody').innerHTML = data.summary_rows_html;
+                    if(data.recent_rows_html) document.getElementById('recentTableBody').innerHTML = data.recent_rows_html;
+
                     const totalHourlyEvents = data.hourly_values.reduce((a, b) => a + b, 0);
 
-                    // Check if database metrics are completely empty
                     if (totalHourlyEvents === 0) {
                         document.getElementById('hourlyContainer').innerHTML = "<div class='chart-placeholder'>Awaiting room tracking metrics data logs...</div>";
                         document.getElementById('compositionContainer').innerHTML = "<div class='chart-placeholder'>Awaiting profile distributions...</div>";
                         return;
+                    }
+
+                    // Restore canvas anchor environments if empty layout placeholders were injected previously
+                    if(!document.getElementById('hourlyChart')) {
+                        document.getElementById('hourlyContainer').innerHTML = '<canvas id="hourlyChart"></canvas>';
+                    }
+                    if(!document.getElementById('compositionChart')) {
+                        document.getElementById('compositionContainer').innerHTML = '<canvas id="compositionChart"></canvas>';
                     }
 
                     if (hourlyChartInstance) hourlyChartInstance.destroy();
@@ -644,7 +680,6 @@ def serve_dashboard():
 
                     conversationHistory.push({ role: "user", content: msgText });
 
-                    // Sliding Context Window: Keep only the last 20 messages to prevent payload bloat or memory leaks
                     if (conversationHistory.length > 20) {
                         conversationHistory = conversationHistory.slice(-20);
                     }
@@ -666,7 +701,6 @@ def serve_dashboard():
                         document.getElementById(loadId).innerText = "Unable to connect to local language model service.";
                     }
                     
-                    // Force clean scroll bounding alignment after DOM layout updates resolve
                     setTimeout(() => { boxEl.scrollTop = boxEl.scrollHeight; }, 50);
                 }
             }

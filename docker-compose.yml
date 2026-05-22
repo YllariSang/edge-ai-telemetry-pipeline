@@ -7,7 +7,7 @@ services:
     ports:
       - "8050:8050"
     volumes:
-      - ./v380_analytics.db:/app/v380_analytics.db
+      - ./data:/app/data
     environment:
       - RTSP_URL=${RTSP_URL}
       - OLLAMA_URL=http://ollama_engine:11434
