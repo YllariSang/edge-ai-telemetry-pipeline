@@ -1,138 +1,131 @@
-# SeeSee: Edge AI Telemetry Pipeline
+# V380-YOLO: Edge AI Telemetry Pipeline
 
-Basically a local, cloud-free telemetry setup for my CCTV camera. It takes a live network stream, runs it through some vision math to track what me and my dog are doing in the room, logs everything to a database, and lets me talk to Llama 3.2:1b completely offline to summarize what happened.
+A local, cloud-free telemetry and security analysis suite for IP cameras. It transforms a standard RTSP feed into a rich, queryable source of behavioral data by tracking human and animal movements, logging activity patterns, and providing a natural language interface for summaries—all completely offline.
 
 ---
 
-## How It Works under the hood
+## How It Works
 
-                   ┌──────────────────────┐
-                   │  V380 IP CCTV Camera │
-                   └──────────┬───────────┘
-                              │ (Live RTSP Stream)
-                              ▼
-                ┌────────────────────────────┐
-                │  Low-Latency Ring Buffer   │
-                └─────────────┬──────────────┘
-                              │ (Decoupled Decoded Frames)
-                              ▼
-                 ┌──────────────────────────┐
-                 │   YOLO11 Object Tensor   │
-                 └────────────┬─────────────┘
-                              │ (Spatial Coordinate Matrix)
-                              ▼
-           ┌──────────────────────────────────────┐
-           │ Advanced Geometric Telemetry Tracker │
-           └──────────────────┬───────────────────┘
-                              │ (Calculated Behavioral Transitions)
-                              ▼
-                  ┌───────────────────────┐
-                  │    SQLite Database    │
-                  └───────────┬───────────┘
-                              │ (Sanitized Relational Log Timeline)
-                              ▼
+The pipeline is designed for high performance and low resource consumption, making it ideal for running on consumer-grade hardware without impacting system performance for other tasks like gaming or development.
 
-┌──────────────┐     ┌──────────────────────┐     ┌────────────────┐
-│ Browser UI   ├────►│ FastAPI Dashboard    ├────►│ Local Ollama   │
-│ Chat Query   │◄────┤ Chat Middleware UI   │◄────┤ (Llama 3.2:1b) │
-└──────────────┘     └──────────────────────┘     └────────────────┘
+```mermaid
+graph TD
+    A[V380 IP CCTV Camera] -->|Live RTSP Stream| B(Low-Latency Ring Buffer);
+    B -->|Decoupled Frames| C{YOLOv11n Object Detection};
+    C -->|Spatial Coordinates & Confidences| D[Advanced Geometric Tracker];
+    D -->|Behavioral Transitions Logged| E(SQLite Database);
+    
+    subgraph "Analytics & Query"
+        direction LR
+        F[Browser UI] <-->|HTTP/WebSocket| G(FastAPI Dashboard);
+        G <-->|SQL Query| E;
+        G <-->|Chat Prompts| H{Local Ollama Engine};
+    end
+    
+    H -->|LLM Response| G;
+```
 
-
-- **Smooth Video Feeds**: Used custom threading to isolate the camera stream frames from the heavy computer vision loops. The live feed stays at a fluid 30 FPS and my PC doesn't lag out when I am playing games.
-- **Lightweight Math Tracking**: Avoided resource-intensive deep learning video models by writing simple geometric math that tracks bounding box aspect ratios and center-point speeds. This dynamically logs states like `Sitting/Working` or `Standing/Moving` without pinning down my CPU.
-- **No Code Jargon**: Added a custom translation layer to clear out ugly database timestamps and strings before passing them to the local model, so Llama talks like a normal home assistant without hallucinating or spitting out random code syntax.
+- **Smooth Video Ingestion**: A dedicated threading model isolates the RTSP stream decoding from the main application logic. This ensures the live video feed remains fluid (targeting 30 FPS) while preventing the resource-intensive AI computations from causing system-wide lag.
+- **Lightweight Behavioral Tracking**: Instead of relying on heavy deep learning models for action recognition, the system uses efficient geometric calculations. It tracks the aspect ratio, velocity, and trajectory of bounding boxes to infer states like `Sitting/Working`, `Standing/Moving`, or `Pacing`, keeping CPU/GPU usage to a minimum.
+- **Natural Language Summaries**: A custom translation layer sanitizes raw database logs (e.g., `2024-05-24 14:22:17`, `Pacing/Moving`) into clean, human-readable context. This allows the local Large Language Model (`llama3.2:1b`) to generate concise, conversational summaries of room activity without "hallucinating" or exposing technical jargon.
 
 ---
 
 ## The Tech Stack
+
 - **OS**: Cross-Platform (Linux, macOS, Windows)
-- **Backend Framework**: FastAPI (Uvicorn ASGI Engine)
-- **Computer Vision**: OpenCV-Python (Headless Framework) & Ultralytics YOLO11
+- **Backend**: FastAPI with Uvicorn ASGI server
+- **Computer Vision**: OpenCV-Python (Headless) & Ultralytics YOLOv11n (OpenVINO optimized)
 - **Database**: SQLite 3
 - **AI Engine**: Ollama running `llama3.2:1b`
 
 ---
 
 ## Project Structure
+
 ```text
-SeeSee/
-├── .gitignore               # Keeps local DB logs, virtual envs, and model weights out of GitHub
-├── README.md                # This file right here
-├── requirements.txt         # The Python package dependencies list
-└── dashboard_app.py         # Production-ready main source code script
+v380-yolo/
+├── .gitignore               # Excludes virtual envs, DB files, and cache from Git
+├── README.md                # This file
+├── requirements.txt         # Python package dependencies
+├── dashboard_app.py         # Main application source code
+└── yolo11n_openvino_model/  # Pre-trained and optimized object detection model
+    ├── metadata.yaml
+    ├── yolo11n.bin
+    └── yolo11n.xml
+```
 
-Run Natively
+---
 
-Since the pipeline uses headless matrix tracking components and standard RTSP streaming, it is completely cross-platform and runs identically on Linux, macOS, and Windows.
-1. Set Up a Virtual Environment
+## Getting Started
 
-Initialize a clean Python environment for your operating system:
+Because the pipeline relies on headless packages and standardized protocols, it runs identically across Linux, macOS, and Windows.
 
-    Linux / macOS:
-    Bash
+### 1. Set Up a Virtual Environment
 
-    python -m venv venv
-    source venv/bin/activate
+Create and activate a clean Python environment.
 
-    Windows (PowerShell):
-    PowerShell
+**Linux / macOS:**
+```bash
+python -m venv venv
+source venv/bin/activate
+```
 
-    python -m venv venv
-    .\venv\Scripts\Activate.ps1
+**Windows (PowerShell):**
+```powershell
+python -m venv venv
+.\venv\Scripts\Activate.ps1
+```
 
-    Windows (Command Prompt):
-    DOS
+**Windows (Command Prompt):**
+```dos
+python -m venv venv
+.\venv\Scripts\activate.bat
+```
 
-    python -m venv venv
-    .\venv\Scripts\activate.bat
+### 2. Install Dependencies
 
-2. Install Dependencies
-
-Install the lightweight, unbloated requirements list (uses headless modules to prevent server GUI driver collisions):
-Bash
-
+Install the required packages using the headless versions to avoid potential GUI driver conflicts on servers.
+```bash
 pip install -r requirements.txt
+```
 
-3. Spin Up Ollama (Local AI Engine)
+### 3. Spin Up Ollama (Local AI Engine)
 
-Ensure your local language model engine is active on localhost:11434 and running the required model profile:
+Ensure your local Ollama instance is running. The application will automatically attempt to pull the required model if it's not present.
 
-    Linux (systemd): sudo systemctl start ollama
+- **Linux**: Start the `ollama` service (`sudo systemctl start ollama`) or run `ollama serve &`.
+- **Windows / macOS**: Launch the Ollama Desktop application.
 
-    Linux (Non-systemd / Manual): ollama serve &
+The app will automatically run the equivalent of `ollama pull llama3.2:1b` on first launch if the model is missing.
 
-    Windows / macOS: Launch the native Ollama Desktop Application from your system application menu.
+### 4. Configure and Launch the Pipeline
 
-Make sure you have downloaded the weights into your engine instance:
-Bash
+Set your camera's RTSP stream URL as an environment variable before launching the app. This keeps your credentials secure and out of the source code.
 
-ollama run llama3.2:1b
+**Linux / macOS:**
+```bash
+export RTSP_URL="rtsp://<username>:<password>@<camera-ip-address>:554/live/ch00_0"
+python dashboard_app.py
+```
 
-4. Export Credentials & Boot the Pipeline
+**Windows (PowerShell):**
+```powershell
+$env:RTSP_URL="rtsp://<username>:<password>@<camera-ip-address>:554/live/ch00_0"
+python dashboard_app.py
+```
 
-Set your camera's live RTSP stream path network details as environment variables and execute the launch runner:
+**Windows (Command Prompt):**
+```dos
+set RTSP_URL="rtsp://<username>:<password>@<camera-ip-address>:554/live/ch00_0"
+python dashboard_app.py
+```
 
-    Linux / macOS:
-    Bash
+Once running, open your browser and navigate to **http://localhost:8050** to access the live analytics dashboard.
 
-    export RTSP_URL="rtsp://<username>:<password>@<camera-ip-address>:554/live/ch00_0"
-    python dashboard_app.py
+---
 
-    Windows (PowerShell):
-    PowerShell
+## Privacy & Security
 
-    $env:RTSP_URL="rtsp://<username>:<password>@<camera-ip-address>:554/live/ch00_0"
-    python dashboard_app.py
-
-    Windows (Command Prompt):
-    DOS
-
-    set RTSP_URL=rtsp://<username>:<password>@<camera-ip-address>:554/live/ch00_0
-    python dashboard_app.py
-
-Open your browser and navigate to http://localhost:8050 to access your live analytics dashboard center!
-Privacy Details
-
-    100% Offline: Zero tracking, remote keys, or cloud subscriptions. Everything stays entirely on the local drive.
-
-    Safe Version Control: Uses environment variables via os.getenv so your real credentials and IP location never get leaked onto public code repository lines.
+- **100% Offline**: No data ever leaves your local machine. There are no cloud subscriptions, remote API keys, or tracking telemetry.
+- **Secure by Design**: Credentials are handled via environment variables (`os.getenv`), ensuring sensitive information like usernames, passwords, and IP addresses are never hardcoded or accidentally committed to a public repository.
