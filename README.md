@@ -1,4 +1,4 @@
-# V380-YOLO: Edge AI Telemetry Pipeline
+# SeeSee: Edge AI Telemetry Pipeline
 
 A local, cloud-free telemetry and security analysis suite for IP cameras. It transforms a standard RTSP feed into a rich, queryable source of behavioral data by tracking human and animal movements, logging activity patterns, and providing a natural language interface for summaries—all completely offline.
 
